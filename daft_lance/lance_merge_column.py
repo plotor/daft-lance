@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import uuid
 from typing import TYPE_CHECKING, Any
 
 import lance
@@ -221,6 +224,123 @@ class GroupFragmentMergeUDF:
         return [{"fragment_meta": daft.pickle.dumps(fragment_meta), "schema": daft.pickle.dumps(schema)}]
 
 
+@daft_cls
+class FastPathFragmentWriter:
+    """Writes new columns as raw .lance files and stitches them into fragment metadata.
+
+    This avoids rewriting existing data — only the new column values are written.
+    Requires rows to be positionally aligned with the fragment (sorted by _rowaddr,
+    complete row count).
+    """
+
+    def __init__(
+        self,
+        lance_ds: lance.LanceDataset,
+        uri: str,
+        new_column_names: list[str],
+        storage_options: dict[str, str] | None = None,
+    ):
+        self.lance_ds = lance_ds
+        self.uri = str(uri)
+        self.new_column_names = new_column_names
+        self.storage_options = storage_options
+
+    @method.batch(return_dtype=_FRAGMENT_HANDLER_RETURN_DTYPE)
+    def __call__(self, *cols: Any) -> list[dict[str, bytes]]:
+        from lance.file import LanceFileWriter
+        from lance.fragment import FragmentMetadata
+
+        if len(cols) == 0:
+            return []
+
+        *data_cols, rowaddr_col, fragment_ids = cols
+        ids = fragment_ids.to_pylist() if hasattr(fragment_ids, "to_pylist") else list(fragment_ids)
+        if len(ids) == 0:
+            return []
+        frag_id = ids[0]
+
+        rowaddrs = rowaddr_col.to_pylist() if hasattr(rowaddr_col, "to_pylist") else list(rowaddr_col)
+
+        # Build table of new columns
+        arrays = []
+        for s in data_cols:
+            arr = pa.array(s.to_pylist() if hasattr(s, "to_pylist") else list(s))
+            arrays.append(arr)
+        tbl = pa.table({name: arr for name, arr in zip(self.new_column_names, arrays)})
+
+        # Sort by _rowaddr to restore positional order
+        sort_indices = pa.compute.sort_indices(
+            pa.table({"_rowaddr": pa.array(rowaddrs, type=pa.uint64())}),
+            sort_keys=[("_rowaddr", "ascending")],
+        )
+        tbl = tbl.take(sort_indices)
+
+        # Determine the existing file format version so the new file matches.
+        # Lance commit rejects fragments whose files mix major/minor versions.
+        fragment = self.lance_ds.get_fragment(frag_id)
+        if fragment is None:
+            raise ValueError(f"Fragment {frag_id} not found in dataset")
+        meta = dict(fragment.metadata.to_json())
+        existing_files = list(meta["files"])
+        if not existing_files:
+            raise ValueError(f"Fragment {frag_id} has no data files; cannot infer version for fast-path write")
+        file_major = int(existing_files[0]["file_major_version"])
+        file_minor = int(existing_files[0]["file_minor_version"])
+
+        # Write raw .lance file with only new columns
+        filename = uuid.uuid4().hex + ".lance"
+        filepath = os.path.join(self.uri, "data", filename)
+        with LanceFileWriter(
+            filepath,
+            tbl.schema,
+            version=f"{file_major}.{file_minor}",
+            storage_options=self.storage_options,
+        ) as writer:
+            for b in tbl.to_batches():
+                writer.write_batch(b)
+        file_size = os.path.getsize(filepath)
+
+        # Determine field IDs for the new columns
+        next_fid = max(f.id() for f in self.lance_ds.lance_schema.fields()) + 1
+
+        # Stitch new data file into fragment metadata
+        new_file_entry = {
+            "path": filename,
+            "fields": list(range(next_fid, next_fid + len(self.new_column_names))),
+            "column_indices": list(range(len(self.new_column_names))),
+            "file_major_version": file_major,
+            "file_minor_version": file_minor,
+            "file_size_bytes": file_size,
+            "base_id": None,
+        }
+        meta["files"] = list(meta["files"]) + [new_file_entry]
+        new_frag_meta = FragmentMetadata.from_json(json.dumps(meta))
+
+        # Build new schema (original + new columns)
+        new_schema = self.lance_ds.schema
+        for col_name in self.new_column_names:
+            col_idx = tbl.schema.get_field_index(col_name)
+            new_schema = new_schema.append(pa.field(col_name, tbl.schema.field(col_idx).type))
+
+        return [{"fragment_meta": daft.pickle.dumps(new_frag_meta), "schema": daft.pickle.dumps(new_schema)}]
+
+
+def _can_use_fast_path(
+    df: daft.DataFrame,
+    lance_ds: lance.LanceDataset,
+    join_key: str,
+) -> bool:
+    if join_key != "_rowaddr":
+        return False
+    if "_rowaddr" not in df.column_names:
+        return False
+    if "fragment_id" not in df.column_names:
+        return False
+    df_row_count = len(df.collect())
+    ds_row_count = lance_ds.count_rows()
+    return df_row_count == ds_row_count
+
+
 def merge_columns_from_df(
     df: daft.DataFrame,
     lance_ds: lance.LanceDataset,
@@ -244,29 +364,107 @@ def merge_columns_from_df(
             f"DataFrame must contain join key column '{join_key}'. If missing, read with default_scan_options={{'with_row_address': True}} to expose '_rowaddr', or include the key explicitly."
         )
 
-    # Derive read_columns if not provided: exactly [join_key] + new columns (not present in dataset schema)
-    if read_columns is None:
-        # Compute dataset existing field names robustly
-        existing_fields: set[str] = set()
+    # Compute existing field names
+    existing_fields: set[str] = set()
+    try:
+        existing_fields = {getattr(f, "name", str(f)) for f in lance_ds.schema}
+    except Exception:
+        names: list[str] = []
         try:
-            existing_fields = {getattr(f, "name", str(f)) for f in lance_ds.schema}
+            names = list(getattr(lance_ds.schema, "names", []))
         except Exception:
-            names = []
             try:
-                names = list(getattr(lance_ds.schema, "names", []))
+                names = [getattr(f, "name", str(f)) for f in getattr(lance_ds.schema, "fields", [])]
             except Exception:
-                try:
-                    names = [getattr(f, "name", str(f)) for f in getattr(lance_ds.schema, "fields", [])]
-                except Exception:
-                    names = []
-            existing_fields = set(names)
-        new_cols = [c for c in df.column_names if c not in existing_fields and c not in ("fragment_id", join_key)]
-        if len(new_cols) == 0:
-            raise ValueError(
-                "No new columns to merge; Lance requires the reader stream to include only the join key and new columns not present in the dataset."
-            )
+                names = []
+        existing_fields = set(names)
+
+    new_cols = [c for c in df.column_names if c not in existing_fields and c not in ("fragment_id", join_key)]
+    if len(new_cols) == 0:
+        raise ValueError(
+            "No new columns to merge; Lance requires the reader stream to include only the join key and new columns not present in the dataset."
+        )
+
+    # Derive read_columns if not provided
+    if read_columns is None:
         read_columns = [join_key] + new_cols
 
+    # Decide: fast path (raw file write) or slow path (keyed join)
+    if _can_use_fast_path(df, lance_ds, join_key):
+        return _merge_fast_path(df, lance_ds, uri, new_cols, storage_options=storage_options)
+
+    return _merge_slow_path(
+        df,
+        lance_ds,
+        uri,
+        read_columns,
+        left_on,
+        right_on,
+        reader_schema,
+        batch_size,
+        storage_options=storage_options,
+    )
+
+
+def _merge_fast_path(
+    df: daft.DataFrame,
+    lance_ds: lance.LanceDataset,
+    uri: str | pathlib.Path,
+    new_column_names: list[str],
+    storage_options: dict[str, Any] | None = None,
+) -> lance.LanceDataset:
+    """Metadata-only add_columns: write raw .lance files and stitch into fragment metadata."""
+    handler = FastPathFragmentWriter(lance_ds, str(uri), new_column_names, storage_options=storage_options)
+
+    grouped = df.groupby("fragment_id").map_groups(
+        handler(*(df[c] for c in new_column_names), df["_rowaddr"], df["fragment_id"]).alias("commit_message")  # type: ignore[attr-defined]
+    )
+
+    commit_messages = grouped.collect().to_pydict()["commit_message"]
+    new_schema = None
+    fragment_metas: list[Any] = []
+    enriched_frag_ids: set[int] = set()
+
+    for commit_message in commit_messages:
+        fragment_meta_bytes = commit_message["fragment_meta"]
+        schema_bytes = commit_message["schema"]
+        if not fragment_meta_bytes or not schema_bytes:
+            continue
+        fmeta = daft.pickle.loads(fragment_meta_bytes)
+        fragment_metas.append(fmeta)
+        # pylance 6.0.0 FragmentMetadata exposes the id only via to_json()
+        enriched_frag_ids.add(int(fmeta.to_json()["id"]))
+        if new_schema is None:
+            new_schema = daft.pickle.loads(schema_bytes)
+
+    if new_schema is None:
+        raise ValueError("Fast path produced no fragment metadata")
+
+    # Include untouched fragments (they'll get NULLs for new columns)
+    for frag in lance_ds.get_fragments():
+        if frag.fragment_id not in enriched_frag_ids:
+            fragment_metas.append(frag.metadata)
+
+    op = lance.LanceOperation.Merge(fragment_metas, new_schema)
+    return lance.LanceDataset.commit(
+        str(uri),
+        op,
+        read_version=lance_ds.version,
+        storage_options=storage_options,
+    )
+
+
+def _merge_slow_path(
+    df: daft.DataFrame,
+    lance_ds: lance.LanceDataset,
+    uri: str | pathlib.Path,
+    read_columns: list[str],
+    left_on: str | None,
+    right_on: str | None,
+    reader_schema: pa.Schema | None,
+    batch_size: int | None,
+    storage_options: dict[str, Any] | None = None,
+) -> lance.LanceDataset:
     handler_udf = GroupFragmentMergeUDF(
         lance_ds,
         left_on,
@@ -287,8 +485,8 @@ def merge_columns_from_df(
     for commit_message in commit_messages:
         fragment_meta = commit_message["fragment_meta"]
         schema = commit_message["schema"]
-        # Skip None values (when there are no new columns to merge)
-        if fragment_meta is None or schema is None:
+        # Skip empty payloads (when there are no new columns to merge)
+        if not fragment_meta or not schema:
             continue
         fragment_metas.append(daft.pickle.loads(fragment_meta))
         if new_schema is None:
